@@ -81,55 +81,145 @@ def parse_line(line):
     except (ValueError, IndexError):
         return None
 
-def process_file(file_path, server_connections, dry_run):
+def process_file_chunk(args):
     """
-    Обрабатывает один файл.
+    Обрабатывает часть файла (чанк).
+
+    Args:
+        args: кортеж (file_path, chunk_start, chunk_size, server_connections, dry_run)
+
+    Returns:
+        dict: результат обработки чанка
+    """
+    file_path, chunk_start, chunk_size, server_connections, dry_run = args
+
+    processed = 0
+    errors = 0
+    lines_processed = []
+
+    try:
+        with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+            # Пропускаем до начала чанка
+            if chunk_start > 0:
+                for _ in range(chunk_start):
+                    try:
+                        next(f)
+                    except StopIteration:
+                        break
+
+            # Обрабатываем чанк
+            for line_num in range(chunk_start, chunk_start + chunk_size):
+                try:
+                    line = next(f)
+                    if not line.strip():
+                        continue
+
+                    parsed = parse_line(line)
+                    if not parsed:
+                        logger.debug(f"Пропущена строка {line_num + 1} в {file_path}")
+                        continue
+
+                    device_type, device_id, lat, lon, apps = parsed
+                    key = f"{device_type}:{device_id}"
+                    phone_log = PhoneLog(lat=lat, lon=lon, apps=apps)
+                    value = phone_log.serialize()
+
+                    server_addr = SUPPORTED_DEVICE_TYPES[device_type]
+                    conn = server_connections[server_addr]
+
+                    if not dry_run:
+                        try:
+                            result = conn.set(key, value)
+                            if not result:
+                                logger.warning(f"Не удалось записать {key} в {server_addr}")
+                        except Exception as e:
+                            logger.error(f"Ошибка записи {key} в {server_addr}: {e}")
+                            errors += 1
+                    else:
+                        logger.debug(f"{server_addr} - {key} -> lat: {lat} lon: {lon} apps: {len(apps)}")
+
+                    processed += 1
+                    lines_processed.append(line_num)
+
+                except StopIteration:
+                    break
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке строки {line_num + 1} в {file_path}: {e}")
+                    errors += 1
+
+    except Exception as e:
+        logger.error(f"Ошибка при открытии файла {file_path}: {e}")
+        return {'processed': 0, 'errors': 1, 'lines': []}
+
+    return {'processed': processed, 'errors': errors, 'lines': lines_processed}
+
+def count_lines_in_gz(file_path):
+    """
+    Подсчитывает количество строк в gz-файле.
+
+    Args:
+        file_path: путь к файлу
+
+    Returns:
+        int: количество строк
+    """
+    count = 0
+    try:
+        with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+            for _ in f:
+                count += 1
+    except Exception as e:
+        logger.error(f"Ошибка при подсчете строк в {file_path}: {e}")
+    return count
+
+def process_file_parallel(file_path, server_connections, dry_run, workers):
+    """
+    Обрабатывает файл с использованием нескольких потоков.
 
     Args:
         file_path: путь к файлу
         server_connections: словарь подключений к серверам
         dry_run: сухой прогон
+        workers: количество потоков
 
     Returns:
         bool: успех обработки
     """
     try:
-        processed = 0
-        with gzip.open(file_path, 'rt', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                if not line.strip():
-                    continue
+        # Подсчитываем общее количество строк
+        total_lines = count_lines_in_gz(file_path)
+        if total_lines == 0:
+            logger.info(f"Файл {os.path.basename(file_path)} пуст")
+            return True
 
-                parsed = parse_line(line)
-                if not parsed:
-                    logger.debug(f"Пропущена строка {line_num} в {file_path}")
-                    continue
+        logger.info(f"Обработка {os.path.basename(file_path)}: {total_lines} строк, {workers} потоков")
 
-                device_type, device_id, lat, lon, apps = parsed
-                key = f"{device_type}:{device_id}"
-                phone_log = PhoneLog(lat=lat, lon=lon, apps=apps)
-                value = phone_log.serialize()
+        # Определяем размер чанка
+        chunk_size = max(1, total_lines // workers)
+        chunks = []
 
-                server_addr = SUPPORTED_DEVICE_TYPES[device_type]
-                conn = server_connections[server_addr]
+        # Создаем задачи для каждого чанка
+        for start in range(0, total_lines, chunk_size):
+            current_chunk_size = min(chunk_size, total_lines - start)
+            chunks.append((file_path, start, current_chunk_size, server_connections, dry_run))
 
-                if not dry_run:
-                    try:
-                        result = conn.set(key, value)
-                        if not result:
-                            logger.warning(f"Не удалось записать {key} в {server_addr}")
-                    except Exception as e:
-                        logger.error(f"Ошибка записи {key} в {server_addr}: {e}")
-                else:
-                    logger.debug(f"{server_addr} - {key} -> lat: {lat} lon: {lon} apps: {len(apps)}")
+        # Обрабатываем чанки параллельно
+        total_processed = 0
+        total_errors = 0
 
-                processed += 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_chunk = {executor.submit(process_file_chunk, chunk): chunk for chunk in chunks}
 
-        logger.info(f"Файл {os.path.basename(file_path)}: обработано {processed} строк")
-        return True
+            for future in as_completed(future_to_chunk):
+                result = future.result()
+                total_processed += result['processed']
+                total_errors += result['errors']
+
+        logger.info(f"Файл {os.path.basename(file_path)}: обработано {total_processed} строк, ошибок: {total_errors}")
+        return total_errors == 0
 
     except Exception as e:
-        logger.error(f"Ошибка при обработке файла {file_path}: {e}")
+        logger.error(f"Ошибка при параллельной обработке файла {file_path}: {e}")
         return False
 
 def setup_memcached_connections(options):
@@ -181,8 +271,9 @@ def get_sorted_files(pattern):
         # Покажем все файлы с их путями
         for f in files_in_dir:
             full_path = os.path.join(directory, f)
-            size = os.path.getsize(full_path)
-            logger.info(f"  {f} ({size} байт)")
+            if os.path.isfile(full_path):
+                size = os.path.getsize(full_path)
+                logger.info(f"  {f} ({size} байт)")
     else:
         logger.error(f"Директория не существует: {directory}")
         return []
@@ -274,21 +365,43 @@ def main():
 
         logger.info(f"Найдено {len(files)} файлов для обработки")
 
-        # Обрабатываем файлы последовательно
+        # Обрабатываем файлы параллельно
         success_count = 0
         start_time = time.time()
 
-        for file_path in files:
-            logger.info(f"Обработка {file_path}")
+        # Определяем количество потоков для обработки файлов
+        file_workers = min(len(files), options.workers)
 
-            if process_file(file_path, server_connections, options.dry):
-                if not options.dry:
-                    if rename_processed_file(file_path):
-                        success_count += 1
-                else:
-                    success_count += 1
-            else:
-                logger.error(f"Не удалось обработать файл {file_path}")
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
+            # Создаем задачи для каждого файла
+            future_to_file = {}
+            for file_path in files:
+                # Для каждого файла используем часть доступных потоков для параллельной обработки строк
+                file_workers_for_processing = max(1, options.workers // len(files))
+                future = executor.submit(
+                    process_file_parallel,
+                    file_path,
+                    server_connections,
+                    options.dry,
+                    file_workers_for_processing
+                )
+                future_to_file[future] = file_path
+
+            # Собираем результаты
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    success = future.result()
+                    if success:
+                        if not options.dry:
+                            if rename_processed_file(file_path):
+                                success_count += 1
+                        else:
+                            success_count += 1
+                    else:
+                        logger.error(f"Не удалось полностью обработать файл {file_path}")
+                except Exception as e:
+                    logger.error(f"Исключение при обработке файла {file_path}: {e}")
 
         total_time = time.time() - start_time
         logger.info(f"Обработка завершена: {success_count}/{len(files)} файлов за {total_time:.2f} сек")
