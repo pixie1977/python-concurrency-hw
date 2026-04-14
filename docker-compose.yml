@@ -1,0 +1,25 @@
+version: '3.8'
+services:
+  memc-idfa:
+    image: memcached:1.6-alpine
+    ports:
+      - "33013:11211"
+    command: memcached -m 64 -c 1024
+
+  memc-gaid:
+    image: memcached:1.6-alpine
+    ports:
+      - "33014:11211"
+    command: memcached -m 64 -c 1024
+
+  memc-adid:
+    image: memcached:1.6-alpine
+    ports:
+      - "33015:11211"
+    command: memcached -m 64 -c 1024
+
+  memc-dvid:
+    image: memcached:1.6-alpine
+    ports:
+      - "33016:11211"
+    command: memcached -m 64 -c 1024
